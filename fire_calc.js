@@ -94,9 +94,9 @@ function estimateDepositYearsToSustainWithdrawals(
     return Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
   }
 
-  for (let depositMonths = 0; depositMonths <= maxYears * MONTHS_IN_YEAR; depositMonths++) {
+  function runSimulation(depositMonths) {
     const retirementMonths = (RETIREMENT_END_AGE - currentAge) * MONTHS_IN_YEAR - depositMonths;
-    if (retirementMonths <= 0) return -1;
+    if (retirementMonths <= 0) return [0, 0];
 
     let successes = 0;
     let retirementBalances = [];
@@ -104,13 +104,13 @@ function estimateDepositYearsToSustainWithdrawals(
     for (let sim = 0; sim < SIMULATIONS; sim++) {
       let balance = startingBalance;
 
-      // Accumulation phase
+      // Accumulation
       for (let m = 0; m < depositMonths; m++) {
         const r = MONTHLY_RETURN_MEAN + MONTHLY_STD_DEV * randomNormal();
         balance = balance * (1 + r) + monthlyDeposit;
       }
 
-      // Retirement phase
+      // Withdrawal
       let tempBalance = balance;
       let success = true;
       for (let m = 0; m < retirementMonths; m++) {
@@ -124,15 +124,43 @@ function estimateDepositYearsToSustainWithdrawals(
 
       if (success) {
         successes++;
-        retirementBalances.push(balance); // record balance at retirement
+        retirementBalances.push(balance);
+      }
+
+      // Early exit: can't possibly hit success rate
+      if ((SIMULATIONS - sim + successes) / SIMULATIONS < successRate) {
+        break;
       }
     }
 
-    if (successes / SIMULATIONS >= successRate) {
-      const avgBalance = retirementBalances.reduce((a, b) => a + b, 0) / retirementBalances.length;
-      return [depositMonths / MONTHS_IN_YEAR, avgBalance];
+    const achievedRate = successes / SIMULATIONS;
+    const avgBalance = retirementBalances.length > 0
+      ? retirementBalances.reduce((a, b) => a + b, 0) / retirementBalances.length
+      : 0;
+
+    return [achievedRate, avgBalance];
+  }
+
+  // Binary search
+  let low = 0;
+  let high = maxYears * MONTHS_IN_YEAR;
+  let bestMonths = -1;
+  let bestAvgBalance = 0;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const [rate, avgBalance] = runSimulation(mid);
+
+    if (rate >= successRate) {
+      bestMonths = mid;
+      bestAvgBalance = avgBalance;
+      high = mid - 1; // try shorter duration
+    } else {
+      low = mid + 1;
     }
   }
 
-  return [-1, 0]; // no solution found within maxYears
+  return bestMonths !== -1
+    ? [bestMonths / MONTHS_IN_YEAR, bestAvgBalance]
+    : [-1, 0];
 }
