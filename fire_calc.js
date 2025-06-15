@@ -1,29 +1,133 @@
 /**
- * Calculates months of saving needed to sustain withdrawal rate until age 95
- * Uses Monte Carlo simulation with separate pension and tax-free accounts
+ * UK Retirement Calculator - Optimized for 30-second Google Sheets limit
+ * 
+ * Optimization Strategy:
+ * 1. INSTANT FAIL any scenario with >4% withdrawal rate (no Monte Carlo)
+ * 2. Standard binary search (no year skipping) for maximum accuracy
+ * 3. Full simulations (1000) for borderline cases (2.5-4% withdrawal)
+ * 4. Each Monte Carlo sim includes both accumulation and retirement randomness
+ * 5. Returns EXPECTED portfolio values, not random outcomes
  * 
  * @customfunction
- * @param {number} pensionBalance - Initial pension balance (taxed on withdrawal)
- * @param {number} taxFreeBalance - Initial tax-free balance (ISA, etc.)
- * @param {number} monthlyPensionSavings - Monthly pension contributions
- * @param {number} monthlyTaxFreeSavings - Monthly tax-free savings
- * @param {number} annualReturn - Expected annual rate of return for stocks (as decimal, e.g., 0.07 for 7%)
- * @param {number} returnStdDev - Standard deviation of annual returns (as decimal)
- * @param {number} monthlyWithdrawalNeeded - Monthly net income needed (after tax)
- * @param {number} currentAge - Current age
- * @param {number} targetSuccessRate - Target success rate (as decimal, e.g., 0.9 for 90%)
- * @param {number} inflationRate - Annual inflation rate (as decimal, e.g., 0.025 for 2.5%)
- * @param {number} withdrawalStrategy - Strategy: 1=Fixed, 2=Guardrails, 3=Cash Buffer, 4=Essential/Discretionary
- * @param {number} essentialExpenseRatio - For strategy 4: ratio of essential to total expenses (default: 0.7)
- * @param {number} maxSavingMonths - Maximum months to test (default: 600 = 50 years)
- * @param {number} simulations - Number of Monte Carlo simulations (default: 1000)
- * @param {boolean} useBondTent - Enable bond tent/glide path (default: false)
- * @param {number} bondReturnRate - Annual return for bonds (default: 0.03 for 3%)
- * @param {number} bondVolatility - Bond volatility (default: 0.05 for 5%)
- * @param {number} stockAllocRetirement - Stock allocation % at retirement start (default: 0.6 for 60%)
- * @param {number} stockAllocLater - Stock allocation % in later retirement (default: 0.4 for 40%)
- * @param {number} glidePeriodYears - Years to transition from retirement to later allocation (default: 10)
- * @returns {number[]} Array: [years_needed, pension_balance_at_retirement, tax_free_balance_at_retirement]
+ */
+
+// Single source of truth for constants
+const UK_PENSION_ACCESS_AGE = 58;
+const UK_STATE_PENSION_AGE = 68;
+const UK_STATE_PENSION_MONTHLY_2024 = 915.40;
+const UK_PENSION_TAX_FREE_PERCENT = 0.25;
+const UK_PENSION_TAX_FREE_LIFETIME_LIMIT = 268275;
+const WITHDRAWAL_TOLERANCE = 0.02;
+
+/**
+ * Single tax calculation function (bug fix: no more duplicates)
+ */
+function calculateUKIncomeTax(annualIncome) {
+  const personalAllowance = 12570;
+  const basicRateThreshold = 50270;
+  const higherRateThreshold = 125140;
+  
+  if (annualIncome <= personalAllowance) return 0;
+  
+  let tax = 0;
+  const taxableIncome = annualIncome - personalAllowance;
+  
+  // Basic rate: 20%
+  if (taxableIncome <= (basicRateThreshold - personalAllowance)) {
+    tax = taxableIncome * 0.20;
+  } else {
+    tax = (basicRateThreshold - personalAllowance) * 0.20;
+    
+    // Higher rate: 40%
+    const higherRateIncome = Math.min(taxableIncome - (basicRateThreshold - personalAllowance),
+                                    higherRateThreshold - basicRateThreshold);
+    tax += higherRateIncome * 0.40;
+    
+    // Additional rate: 45%
+    if (taxableIncome > (higherRateThreshold - personalAllowance)) {
+      const additionalRateIncome = taxableIncome - (higherRateThreshold - personalAllowance);
+      tax += additionalRateIncome * 0.45;
+    }
+  }
+  
+  return tax;
+}
+
+/**
+ * Adaptive simulations focused on 4% threshold
+ * Increase simulations for short accumulation periods to reduce variance
+ */
+function getAdaptiveSimulations(pensionBalance, taxFreeBalance, monthlyWithdrawalNeeded, baseSimulations, yearsToRetirement) {
+  const totalBalance = pensionBalance + taxFreeBalance;
+  const annualWithdrawal = monthlyWithdrawalNeeded * 12;
+  const withdrawalRate = totalBalance > 0 ? annualWithdrawal / totalBalance : 1;
+  
+  // For very short accumulation periods, we need MORE simulations to reduce variance
+  if (yearsToRetirement < 2) {
+    console.log(`Short accumulation period (${yearsToRetirement.toFixed(1)} years), using maximum simulations`);
+    return baseSimulations; // Always use full simulations for < 2 years
+  }
+  
+  // We know >4% will be instant failed, so this is for ≤4% cases
+  
+  // Borderline cases (2.5-4%) - your sweet spot, need maximum accuracy
+  if (withdrawalRate >= 0.025 && withdrawalRate <= 0.04) {
+    return baseSimulations; // Full 1000 simulations
+  }
+  
+  // Safe cases (< 2.5%) - can reduce moderately
+  if (withdrawalRate < 0.02) {
+    return Math.max(400, Math.floor(baseSimulations * 0.4)); // 400 simulations
+  }
+  
+  if (withdrawalRate < 0.025) {
+    return Math.max(600, Math.floor(baseSimulations * 0.6)); // 600 simulations
+  }
+  
+  // Should not reach here (>4% is instant failed)
+  return baseSimulations;
+}
+
+/**
+ * Early exit optimized for scenarios that passed 4% threshold
+ * Since >4% are instant failed, these are more likely to succeed
+ */
+function shouldExitEarly(successes, failures, totalSimulations, targetRate) {
+  const completed = successes + failures;
+  
+  // Need minimum samples
+  if (completed < 50) return false;
+  
+  const currentRate = successes / completed;
+  
+  // For scenarios that made it past 4% threshold, be more conservative
+  // Only exit on very clear outcomes
+  
+  if (completed >= 100) {
+    // Exit if clearly failing (but this is less likely since >4% already filtered)
+    if (currentRate < targetRate * 0.5) return true;
+    
+    // Exit if clearly succeeding
+    if (currentRate > targetRate * 1.2) return true;
+  }
+  
+  if (completed >= 200) {
+    const remaining = totalSimulations - completed;
+    
+    // Mathematical impossibility checks
+    const worstPossibleRate = successes / totalSimulations;
+    if (worstPossibleRate > targetRate * 1.05) return true;
+    
+    const bestPossibleRate = (successes + remaining) / totalSimulations;
+    if (bestPossibleRate < targetRate * 0.95) return true;
+  }
+  
+  return false;
+}
+
+/**
+ * Main calculation function with 30-second optimizations
+ * @customfunction
  */
 function calculateSavingMonthsForRetirement(
   pensionBalance,
@@ -39,605 +143,685 @@ function calculateSavingMonthsForRetirement(
   withdrawalStrategy = 1,
   essentialExpenseRatio = 0.7,
   useBondTent = false,
-  bondReturnRate = 0.05,
-  bondVolatility = 0.08,
-  stockAllocRetirement = 0.8,
-  stockAllocLater = 0.8,
   maxSavingMonths = 600,
   simulations = 1000,
+  bondReturnRate = 0.03,
+  bondVolatility = 0.05,
+  stockAllocRetirement = 0.6,
+  stockAllocLater = 0.4,
   glidePeriodYears = 10
 ) {
-  try {
-    // Input validation
-    if (currentAge >= 95 || currentAge < 18) {
-      throw new Error("Current age must be between 18 and 95");
-    }
-    if (targetSuccessRate <= 0 || targetSuccessRate > 1) {
-      throw new Error("Target success rate must be between 0 and 1");
-    }
-    if (annualReturn < -0.5 || annualReturn > 0.5) {
-      throw new Error("Annual return must be between -50% and 50%");
-    }
-    if (returnStdDev < 0 || returnStdDev > 1) {
-      throw new Error("Return standard deviation must be between 0 and 100%");
-    }
-    if (monthlyWithdrawalNeeded <= 0) {
-      throw new Error("Monthly withdrawal needed must be positive");
-    }
-    if (pensionBalance < 0 || taxFreeBalance < 0) {
-      throw new Error("Account balances cannot be negative");
-    }
-    if (monthlyPensionSavings < 0 || monthlyTaxFreeSavings < 0) {
-      throw new Error("Monthly savings cannot be negative");
-    }
-    if (inflationRate < 0 || inflationRate > 0.2) {
-      throw new Error("Inflation rate must be between 0% and 20%");
-    }
-    if (essentialExpenseRatio < 0 || essentialExpenseRatio > 1) {
-      throw new Error("Essential expense ratio must be between 0 and 1");
-    }
-    if (withdrawalStrategy < 1 || withdrawalStrategy > 4) {
-      throw new Error("Withdrawal strategy must be 1-4");
-    }
-    if (useBondTent) {
-      if (bondReturnRate < 0 || bondReturnRate > 0.2) {
-        throw new Error("Bond return rate must be between 0% and 20%");
-      }
-      if (bondVolatility < 0 || bondVolatility > 0.5) {
-        throw new Error("Bond volatility must be between 0% and 50%");
-      }
-      if (stockAllocRetirement < 0 || stockAllocRetirement > 1) {
-        throw new Error("Stock allocation at retirement must be between 0 and 1");
-      }
-      if (stockAllocLater < 0 || stockAllocLater > 1) {
-        throw new Error("Stock allocation in later years must be between 0 and 1");
-      }
-      if (glidePeriodYears < 0 || glidePeriodYears > 30) {
-        throw new Error("Glide period must be between 0 and 30 years");
-      }
-    }
-
-    // Constants
-    const UK_PENSION_ACCESS_AGE = 58;
-    const UK_STATE_PENSION_AGE = 68;
-    const UK_STATE_PENSION_MONTHLY_2024 = 915.40;
-    const WITHDRAWAL_TOLERANCE = 0.02;
-    
-    const monthsToAge95 = (95 - currentAge) * 12;
-    const monthlyReturn = annualReturn / 12;
-    const monthlyStdDev = returnStdDev / Math.sqrt(12);
-    
-    // Bond tent parameters
-    const monthlyBondReturn = bondReturnRate / 12;
-    const monthlyBondStdDev = bondVolatility / Math.sqrt(12);
-
-    // Strategy constants
-    const GUARDRAILS_THRESHOLD = 0.8;
-    const GUARDRAILS_ADJUSTMENT = 0.9;
-    const BUFFER_MONTHS = 18;
-    const BUFFER_MAX_PERCENT = 0.15;
-    const BUFFER_ANNUAL_RETURN = 0.02;
-    const QUARTERLY_REPLENISH_THRESHOLD = 0.045;
-    const ESSENTIAL_FLOOR = 0.8;
-    const DISCRETIONARY_CEILING = 1.2;
-
-    /**
-     * Generate random return using Box-Muller transformation
-     */
-    function generateRandomReturn() {
-      const u1 = Math.random();
-      const u2 = Math.random();
-      const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-      return monthlyReturn + (monthlyStdDev * z);
-    }
-
-    /**
-     * Generate random bond return using Box-Muller transformation
-     */
-    function generateRandomBondReturn() {
-      const u1 = Math.random();
-      const u2 = Math.random();
-      const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-      return monthlyBondReturn + (monthlyBondStdDev * z);
-    }
-
-    /**
-     * Calculate stock allocation based on bond tent glide path
-     */
-    function getStockAllocation(yearsIntoRetirement) {
-      if (!useBondTent) {
-        return 1.0; // 100% stocks if no bond tent
-      }
-      
-      if (yearsIntoRetirement <= 0) {
-        return stockAllocRetirement;
-      } else if (yearsIntoRetirement >= glidePeriodYears) {
-        return stockAllocLater;
-      } else {
-        // Linear interpolation during glide period
-        const progress = yearsIntoRetirement / glidePeriodYears;
-        return stockAllocRetirement + (stockAllocLater - stockAllocRetirement) * progress;
-      }
-    }
-
-    /**
-     * Generate blended portfolio return based on stock/bond allocation
-     */
-    function generatePortfolioReturn(yearsIntoRetirement) {
-      const stockAlloc = getStockAllocation(yearsIntoRetirement);
-      const bondAlloc = 1 - stockAlloc;
-      
-      const stockReturn = generateRandomReturn();
-      const bondReturn = useBondTent ? generateRandomBondReturn() : 0;
-      
-      return (stockReturn * stockAlloc) + (bondReturn * bondAlloc);
-    }
-
-    /**
-     * Calculate UK income tax on annual income
-     */
-    function calculateUKIncomeTax(grossAnnualIncome) {
-      const personalAllowance = 12570;
-      const basicRateLimit = 50270;
-      const higherRateLimit = 125140;
-      const basicRate = 0.20;
-      const higherRate = 0.40;
-      const additionalRate = 0.45;
-      
-      if (grossAnnualIncome <= personalAllowance) return 0;
-      
-      let tax = 0;
-      let taxableIncome = grossAnnualIncome - personalAllowance;
-      
-      // Basic rate
-      if (taxableIncome > 0) {
-        const basicRateTaxable = Math.min(taxableIncome, basicRateLimit - personalAllowance);
-        tax += basicRateTaxable * basicRate;
-        taxableIncome -= basicRateTaxable;
-      }
-      
-      // Higher rate
-      if (taxableIncome > 0) {
-        const higherRateTaxable = Math.min(taxableIncome, higherRateLimit - basicRateLimit);
-        tax += higherRateTaxable * higherRate;
-        taxableIncome -= higherRateTaxable;
-      }
-      
-      // Additional rate
-      if (taxableIncome > 0) {
-        tax += taxableIncome * additionalRate;
-      }
-      
-      return tax;
-    }
-
-    /**
-     * Calculate state pension (fixed rate)
-     */
-    function calculateStatePension(currentAge) {
-      if (currentAge < UK_STATE_PENSION_AGE) return 0;
-      return UK_STATE_PENSION_MONTHLY_2024;
-    }
-
-    /**
-     * Calculate inflation-adjusted withdrawal amount
-     */
-    function getInflationAdjustedAmount(baseAmount, yearsElapsed) {
-      return baseAmount * Math.pow(1 + inflationRate, yearsElapsed);
-    }
-
-    /**
-     * Calculate withdrawal amount based on strategy
-     */
-    function getStrategyWithdrawalAmount(baseAmount, portfolioValue, initialValue, monthsElapsed, strategy) {
-      // For bond tent, use blended expected return for performance calculation
-      let expectedMonthlyReturn = monthlyReturn; // Default to stock return
-      if (useBondTent) {
-        const yearsElapsed = monthsElapsed / 12;
-        const stockAlloc = getStockAllocation(yearsElapsed);
-        const bondAlloc = 1 - stockAlloc;
-        expectedMonthlyReturn = (monthlyReturn * stockAlloc) + (monthlyBondReturn * bondAlloc);
-      }
-      
-      const expectedValue = initialValue * Math.pow(1 + expectedMonthlyReturn, monthsElapsed);
-      const performanceRatio = expectedValue > 0 ? portfolioValue / expectedValue : 1;
-      
-      switch (strategy) {
-        case 1: // Fixed
-          return baseAmount;
-          
-        case 2: // Guardrails
-        case 3: // Cash Buffer (uses guardrails when not using buffer)
-          if (performanceRatio < GUARDRAILS_THRESHOLD) {
-            return baseAmount * GUARDRAILS_ADJUSTMENT;
-          } else {
-            return baseAmount;
-          }
-          
-        case 4: // Essential/Discretionary
-          const essentialAmount = baseAmount * essentialExpenseRatio;
-          const discretionaryAmount = baseAmount * (1 - essentialExpenseRatio);
-          
-          if (performanceRatio < ESSENTIAL_FLOOR) {
-            const reduction = Math.min(0.5, (ESSENTIAL_FLOOR - performanceRatio) / 0.2 * 0.5);
-            return essentialAmount + (discretionaryAmount * (1 - reduction));
-          } else if (performanceRatio > DISCRETIONARY_CEILING) {
-            const increase = Math.min(0.3, (performanceRatio - DISCRETIONARY_CEILING) / 0.3 * 0.3);
-            return essentialAmount + (discretionaryAmount * (1 + increase));
-          } else {
-            return baseAmount;
-          }
-          
-        default:
-          return baseAmount;
-      }
-    }
-
-    /**
-     * Calculate optimal withdrawal from accounts
-     */
-    function calculateOptimalWithdrawal(pensionBal, taxFreeBal, targetIncome, currentAge) {
-      const statePension = calculateStatePension(currentAge);
-      const adjustedTarget = Math.max(0, targetIncome - statePension);
-      
-      if (adjustedTarget <= 0) {
-        return {
-          pensionWithdrawal: 0,
-          taxFreeWithdrawal: 0,
-          totalTax: 0,
-          netIncome: statePension
-        };
-      }
-
-      // Before age 58: tax-free only
-      if (currentAge < UK_PENSION_ACCESS_AGE) {
-        const withdrawal = Math.min(adjustedTarget, taxFreeBal);
-        return {
-          pensionWithdrawal: 0,
-          taxFreeWithdrawal: withdrawal,
-          totalTax: 0,
-          netIncome: withdrawal + statePension
-        };
-      }
-
-      // Age 58+: pension first for tax efficiency
-      let low = adjustedTarget;
-      let high = Math.min(pensionBal, adjustedTarget * 2);
-      
-      // Binary search for optimal pension withdrawal
-      for (let i = 0; i < 20; i++) {
-        const mid = (low + high) / 2;
-        const combinedGross = mid + statePension;
-        const totalTax = calculateUKIncomeTax(combinedGross * 12) / 12;
-        const stateTax = calculateUKIncomeTax(statePension * 12) / 12;
-        const pensionTax = totalTax - stateTax;
-        const netFromPension = mid - pensionTax;
-        
-        if (Math.abs(netFromPension - adjustedTarget) < 0.01) break;
-        
-        if (netFromPension < adjustedTarget) {
-          low = mid;
-        } else {
-          high = mid;
-        }
-      }
-      
-      const pensionWithdrawal = Math.min(pensionBal, (low + high) / 2);
-      const combinedGross = pensionWithdrawal + statePension;
-      const totalTax = calculateUKIncomeTax(combinedGross * 12) / 12;
-      const stateTax = calculateUKIncomeTax(statePension * 12) / 12;
-      const pensionTax = totalTax - stateTax;
-      const netFromPension = pensionWithdrawal - pensionTax;
-      
-      // Use tax-free for shortfall
-      const shortfall = Math.max(0, adjustedTarget - netFromPension);
-      const taxFreeWithdrawal = Math.min(shortfall, taxFreeBal);
-      
-      return {
-        pensionWithdrawal,
-        taxFreeWithdrawal,
-        totalTax: pensionTax,
-        netIncome: netFromPension + taxFreeWithdrawal + statePension
-      };
-    }
-
-    /**
-     * Run Monte Carlo simulation
-     */
-    function simulateRetirement(savingMonths) {
-      let successfulSimulations = 0;
-      let totalPensionAtRetirement = 0;
-      let totalTaxFreeAtRetirement = 0;
-      
-      for (let sim = 0; sim < simulations; sim++) {
-        let pensionBal = pensionBalance;
-        let taxFreeBal = taxFreeBalance;
-        let cashBuffer = 0;
-        let initialBufferTarget = 0;
-        let recentReturns = []; // Track recent returns for 3-month calculation
-        let bearMarketMonths = 0; // Track prolonged downturns
-        
-        // Accumulation phase - always 100% stocks
-        for (let month = 0; month < savingMonths; month++) {
-          const currentReturn = generateRandomReturn(); // Full stock returns during accumulation
-          pensionBal = pensionBal * (1 + currentReturn) + monthlyPensionSavings;
-          taxFreeBal = taxFreeBal * (1 + currentReturn) + monthlyTaxFreeSavings;
-        }
-        
-        const retirementPensionBalance = pensionBal;
-        const retirementTaxFreeBalance = taxFreeBal;
-        const initialTotalBalance = pensionBal + taxFreeBal;
-        
-        // Initialize cash buffer for strategy 3
-        if (withdrawalStrategy === 3) {
-          const bufferAmount = monthlyWithdrawalNeeded * BUFFER_MONTHS;
-          const maxBufferFromTaxFree = taxFreeBal * BUFFER_MAX_PERCENT;
-          cashBuffer = Math.min(bufferAmount, maxBufferFromTaxFree);
-          taxFreeBal = Math.max(0, taxFreeBal - cashBuffer);
-          initialBufferTarget = cashBuffer;
-        }
-        
-        // Withdrawal phase
-        const withdrawalMonths = monthsToAge95 - savingMonths;
-        const retirementStartAge = currentAge + (savingMonths / 12);
-        let simulationSuccess = true;
-        
-        for (let month = 0; month < withdrawalMonths && simulationSuccess; month++) {
-          const yearsIntoRetirement = month / 12;
-          const currentReturn = generatePortfolioReturn(yearsIntoRetirement); // Use blended return
-          const currentRetirementAge = retirementStartAge + yearsIntoRetirement;
-          
-          // Track recent returns for 3-month performance calculation
-          recentReturns.push(currentReturn);
-          if (recentReturns.length > 3) {
-            recentReturns.shift(); // Keep only last 3 months
-          }
-          
-          // Track bear market duration for adaptive buffer replenishment
-          if (currentReturn < -0.01) { // Month with >1% decline
-            bearMarketMonths++;
-          } else if (currentReturn > 0.01) { // Month with >1% gain
-            bearMarketMonths = Math.max(0, bearMarketMonths - 1); // Slowly reduce bear market counter
-          }
-          
-          // Calculate inflation-adjusted withdrawal need
-          const inflationAdjustedWithdrawal = getInflationAdjustedAmount(monthlyWithdrawalNeeded, yearsIntoRetirement);
-          
-          // Apply returns
-          pensionBal = Math.max(0, pensionBal * (1 + currentReturn));
-          taxFreeBal = Math.max(0, taxFreeBal * (1 + currentReturn));
-          
-          // Cash buffer earns 2% annually
-          if (cashBuffer > 0) {
-            cashBuffer = cashBuffer * (1 + (BUFFER_ANNUAL_RETURN / 12));
-          }
-          
-          // Critical rule: tax-free must last until pension access
-          if (currentRetirementAge < UK_PENSION_ACCESS_AGE && taxFreeBal <= 0 && cashBuffer <= 0) {
-            simulationSuccess = false;
-            break;
-          }
-          
-          // Determine withdrawal approach
-          let useBuffer = false;
-          let bufferAmount = 0;
-          let targetAmount = inflationAdjustedWithdrawal;
-          
-          if (withdrawalStrategy === 3) {
-            // Use cash buffer during any negative return month if available
-            if (currentReturn < 0 && cashBuffer > 0) {
-              // Use partial or full buffer
-              bufferAmount = Math.min(cashBuffer, inflationAdjustedWithdrawal);
-              if (bufferAmount >= inflationAdjustedWithdrawal) {
-                useBuffer = true; // Can cover full withdrawal
-              } else {
-                targetAmount = inflationAdjustedWithdrawal - bufferAmount; // Remaining from investments
-              }
-            }
-            
-            // Apply guardrails to investment portion (use full baseline for fair comparison)
-            if (!useBuffer || bufferAmount < inflationAdjustedWithdrawal) {
-              const currentPortfolioValue = pensionBal + taxFreeBal;
-              targetAmount = getStrategyWithdrawalAmount(
-                targetAmount,
-                currentPortfolioValue,
-                initialTotalBalance, // Use full baseline, not reduced
-                month,
-                withdrawalStrategy
-              );
-            }
-          } else {
-            // Other strategies
-            const currentPortfolioValue = pensionBal + taxFreeBal;
-            targetAmount = getStrategyWithdrawalAmount(
-              inflationAdjustedWithdrawal,
-              currentPortfolioValue,
-              initialTotalBalance,
-              month,
-              withdrawalStrategy
-            );
-          }
-          
-          // Execute withdrawal
-          if (useBuffer) {
-            // Use buffer for full withdrawal
-            cashBuffer -= inflationAdjustedWithdrawal;
-          } else {
-            // Partial buffer use + investment withdrawal
-            if (bufferAmount > 0) {
-              cashBuffer -= bufferAmount;
-            }
-            
-            const withdrawal = calculateOptimalWithdrawal(
-              pensionBal,
-              taxFreeBal,
-              targetAmount,
-              currentRetirementAge
-            );
-            
-            const totalNetIncome = withdrawal.netIncome + bufferAmount;
-            if (totalNetIncome < targetAmount * (1 - WITHDRAWAL_TOLERANCE)) {
-              simulationSuccess = false;
-              break;
-            }
-            
-            pensionBal = Math.max(0, pensionBal - withdrawal.pensionWithdrawal);
-            taxFreeBal = Math.max(0, taxFreeBal - withdrawal.taxFreeWithdrawal);
-            
-            // Replenish buffer quarterly during strong 3-month performance (strategy 3 only)
-            if (withdrawalStrategy === 3 && month % 3 === 0 && recentReturns.length === 3) {
-              // Calculate actual 3-month compound return
-              let portfolioReturn3Month = 1;
-              for (let i = 0; i < recentReturns.length; i++) {
-                portfolioReturn3Month *= (1 + recentReturns[i]);
-              }
-              portfolioReturn3Month -= 1; // Convert back to percentage
-              
-              // Adaptive replenishment based on bear market duration
-              let replenishThreshold = QUARTERLY_REPLENISH_THRESHOLD;
-              let maxReplenishMultiplier = 4; // Base: 4 months per quarter
-              
-              if (bearMarketMonths > 12) {
-                // After prolonged downturn (12+ months), be very cautious
-                replenishThreshold = QUARTERLY_REPLENISH_THRESHOLD * 1.5; // Need 6.75% quarterly return
-                maxReplenishMultiplier = 2; // Only 2 months per quarter
-              } else if (bearMarketMonths > 6) {
-                // After moderate downturn (6-12 months), be somewhat cautious
-                replenishThreshold = QUARTERLY_REPLENISH_THRESHOLD * 1.25; // Need 5.6% quarterly return
-                maxReplenishMultiplier = 3; // Only 3 months per quarter
-              }
-              
-              if (portfolioReturn3Month > replenishThreshold) {
-                // Buffer target grows slowly (half inflation rate)
-                const currentBufferTarget = initialBufferTarget * Math.pow(1 + (inflationRate / 2), yearsIntoRetirement);
-                const bufferShortfall = currentBufferTarget - cashBuffer;
-                
-                if (bufferShortfall > inflationAdjustedWithdrawal * 2) {
-                  const maxReplenish = Math.min(
-                    inflationAdjustedWithdrawal * maxReplenishMultiplier,
-                    taxFreeBal * 0.05,
-                    bufferShortfall
-                  );
-                  if (maxReplenish > 0) {
-                    taxFreeBal = Math.max(0, taxFreeBal - maxReplenish);
-                    cashBuffer += maxReplenish;
-                  }
-                }
-              }
-            }
-          }
-          
-          // Check if all funds depleted
-          if (pensionBal <= 0 && taxFreeBal <= 0 && cashBuffer <= 0 && currentRetirementAge < 95) {
-            simulationSuccess = false;
-            break;
-          }
-        }
-        
-        if (simulationSuccess) {
-          successfulSimulations++;
-          totalPensionAtRetirement += retirementPensionBalance;
-          totalTaxFreeAtRetirement += retirementTaxFreeBalance;
-        }
-      }
-      
-      const successRate = successfulSimulations / simulations;
-      const avgPensionAtRetirement = successfulSimulations > 0 ? 
-        totalPensionAtRetirement / successfulSimulations : 0;
-      const avgTaxFreeAtRetirement = successfulSimulations > 0 ? 
-        totalTaxFreeAtRetirement / successfulSimulations : 0;
-      
-      return {
-        successRate,
-        avgPensionAtRetirement,
-        avgTaxFreeAtRetirement
-      };
-    }
-
-    // Binary search for minimum saving months
-    let left = 0;
-    let right = maxSavingMonths;
-    let bestResult = null;
-    
-    while (left <= right) {
-      const savingMonths = Math.floor((left + right) / 2);
-      const result = simulateRetirement(savingMonths);
-      
-      if (result.successRate >= targetSuccessRate) {
-        bestResult = { 
-          monthsNeeded: savingMonths,
-          successRate: result.successRate,
-          targetPensionBalance: result.avgPensionAtRetirement,
-          targetTaxFreeBalance: result.avgTaxFreeAtRetirement
-        };
-        right = savingMonths - 1;
-      } else {
-        left = savingMonths + 1;
-      }
-    }
-
-    if (bestResult && bestResult.monthsNeeded <= maxSavingMonths) {
-      return [
-        bestResult.monthsNeeded / 12,
-        Math.round(bestResult.targetPensionBalance),
-        Math.round(bestResult.targetTaxFreeBalance)
-      ];
-    } else {
-      return [-1, 0, 0];
-    }
-    
-  } catch (error) {
-    return [-2, 0, 0];
+  const startTime = Date.now();
+  
+  // Input validation
+  if (pensionBalance < 0 || taxFreeBalance < 0) {
+    throw new Error("Balances must be non-negative");
   }
-}
+  if (monthlyPensionSavings < 0 || monthlyTaxFreeSavings < 0) {
+    throw new Error("Savings amounts must be non-negative");
+  }
+  if (annualReturn < -0.5 || annualReturn > 0.5) {
+    throw new Error("Annual return must be between -50% and 50%");
+  }
+  if (returnStdDev < 0 || returnStdDev > 1) {
+    throw new Error("Standard deviation must be between 0% and 100%");
+  }
+  if (monthlyWithdrawalNeeded <= 0) {
+    throw new Error("Monthly withdrawal must be positive");
+  }
+  if (currentAge < 18 || currentAge > 90) {
+    throw new Error("Current age must be between 18 and 90");
+  }
+  if (targetSuccessRate < 0.1 || targetSuccessRate > 1) {
+    throw new Error("Success rate must be between 10% and 100%");
+  }
+  if (withdrawalStrategy < 1 || withdrawalStrategy > 4) {
+    throw new Error("Withdrawal strategy must be 1-4");
+  }
+  if (useBondTent) {
+    if (bondReturnRate < 0 || bondReturnRate > 0.2) {
+      throw new Error("Bond return rate must be between 0% and 20%");
+    }
+    if (bondVolatility < 0 || bondVolatility > 0.5) {
+      throw new Error("Bond volatility must be between 0% and 50%");
+    }
+    if (stockAllocRetirement < 0 || stockAllocRetirement > 1) {
+      throw new Error("Stock allocation at retirement must be between 0 and 1");
+    }
+    if (stockAllocLater < 0 || stockAllocLater > 1) {
+      throw new Error("Stock allocation in later years must be between 0 and 1");
+    }
+    if (glidePeriodYears < 0 || glidePeriodYears > 30) {
+      throw new Error("Glide period must be between 0 and 30 years");
+    }
+  }
 
-/**
- * Test different withdrawal strategies with and without bond tent
- */
-function testWithdrawalStrategies() {
-  console.log("=== Withdrawal Strategy Comparison ===");
+  const monthsToAge95 = (95 - currentAge) * 12;
+  const monthlyReturn = annualReturn / 12;
+  const monthlyStdDev = returnStdDev / Math.sqrt(12);
+  const monthlyBondReturn = bondReturnRate / 12;
+  const monthlyBondStdDev = bondVolatility / Math.sqrt(12);
+
+  // Helper functions
   
-  const strategies = [
-    { id: 1, name: "Fixed Withdrawal" },
-    { id: 2, name: "Guardrails Strategy" },
-    { id: 3, name: "Cash Buffer Strategy" },
-    { id: 4, name: "Essential/Discretionary (70/30)" }
-  ];
+  /**
+   * Generate random return using Box-Muller transformation
+   */
+  function generateRandomReturn() {
+    const u1 = Math.random();
+    const u2 = Math.random();
+    const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    return monthlyReturn + (monthlyStdDev * z);
+  }
+
+  /**
+   * Generate random annual return
+   */
+  function generateAnnualReturn() {
+    const u1 = Math.random();
+    const u2 = Math.random();
+    const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    return annualReturn + (returnStdDev * z);
+  }
+
+  /**
+   * Generate random annual bond return
+   */
+  function generateAnnualBondReturn() {
+    const u1 = Math.random();
+    const u2 = Math.random();
+    const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    return bondReturnRate + (bondVolatility * z);
+  }
+
+  /**
+   * Calculate state pension based on age
+   */
+  function calculateStatePension(age) {
+    return age >= UK_STATE_PENSION_AGE ? UK_STATE_PENSION_MONTHLY_2024 : 0;
+  }
+
+  /**
+   * Calculate stock allocation based on bond tent glide path
+   */
+  function getStockAllocation(yearsIntoRetirement) {
+    if (!useBondTent) {
+      return 1.0; // 100% stocks if no bond tent
+    }
+    
+    if (yearsIntoRetirement <= 0) {
+      return stockAllocRetirement;
+    } else if (yearsIntoRetirement >= glidePeriodYears) {
+      return stockAllocLater;
+    } else {
+      // Linear interpolation during glide period
+      const progress = yearsIntoRetirement / glidePeriodYears;
+      return stockAllocRetirement + (stockAllocLater - stockAllocRetirement) * progress;
+    }
+  }
+
+  /**
+   * Get annual portfolio return based on bond tent allocation
+   */
+  function getAnnualPortfolioReturn(yearsIntoRetirement) {
+    const stockAlloc = getStockAllocation(yearsIntoRetirement);
+    const bondAlloc = 1 - stockAlloc;
+    
+    const stockReturn = generateAnnualReturn();
+    const bondReturn = useBondTent ? generateAnnualBondReturn() : 0;
+    
+    return (stockReturn * stockAlloc) + (bondReturn * bondAlloc);
+  }
+
+  /**
+   * Calculate withdrawal amount based on strategy
+   */
+  function getStrategyWithdrawalAmount(baseAmount, portfolioValue, initialValue, yearsElapsed, strategy) {
+    let expectedAnnualReturn = annualReturn;
+    if (useBondTent) {
+      const stockAlloc = getStockAllocation(yearsElapsed);
+      const bondAlloc = 1 - stockAlloc;
+      expectedAnnualReturn = (annualReturn * stockAlloc) + (bondReturnRate * bondAlloc);
+    }
+    
+    const expectedValue = initialValue * Math.pow(1 + expectedAnnualReturn, yearsElapsed);
+    const performanceRatio = expectedValue > 0 ? portfolioValue / expectedValue : 1;
+
+    switch (strategy) {
+      case 1: // Fixed withdrawal
+        return baseAmount;
+      
+      case 2: // Guardrails strategy
+        if (performanceRatio < 0.8) {
+          return baseAmount * 0.9; // 10% reduction
+        } else if (performanceRatio > 1.2) {
+          return baseAmount * 1.1; // 10% increase
+        }
+        return baseAmount;
+      
+      case 3: // Cash buffer strategy - handled separately
+        return baseAmount;
+      
+      case 4: // Essential/discretionary split
+        if (performanceRatio < 0.9) {
+          return baseAmount * essentialExpenseRatio; // Only essential expenses
+        }
+        return baseAmount;
+      
+      default:
+        return baseAmount;
+    }
+  }
+
+  /**
+   * Calculate cash buffer amount for strategy 3
+   */
+  function calculateCashBufferAmount(recentReturns, bearMarketMonths, targetAmount) {
+    if (recentReturns.length === 0) return 0;
+    
+    const avgReturn = recentReturns.reduce((sum, ret) => sum + ret, 0) / recentReturns.length;
+    
+    let bufferMultiplier = 0;
+    
+    if (avgReturn < -0.1) { // Average annual return below -10%
+      bufferMultiplier = 0.5; // 50% buffer
+    } else if (avgReturn < 0) { // Negative but above -10%
+      bufferMultiplier = 0.25; // 25% buffer
+    } else if (bearMarketMonths > 24) { // Extended bear market (2+ years)
+      bufferMultiplier = 0.3; // 30% buffer
+    } else if (bearMarketMonths > 12) { // Bear market (1+ year)
+      bufferMultiplier = 0.15; // 15% buffer
+    }
+    
+    return targetAmount * bufferMultiplier;
+  }
+
+  /**
+   * Calculate optimal annual withdrawal from accounts
+   * Bug fix: Now uses single tax calculation function
+   */
+  function calculateOptimalAnnualWithdrawal(pensionBal, taxFreeBal, targetIncome, currentAge, taxFreeUsed = 0, yearsRemaining = 0, useOptimization = true, inflationRate = 0.025, useBondTent = false, annualReturn = 0.07, bondReturnRate = 0.03, stockAllocRetirement = 0.6, stockAllocLater = 0.4, glidePeriodYears = 10) {
+    const statePension = calculateStatePension(currentAge) * 12; // Annual state pension
+    let adjustedTarget = Math.max(0, targetIncome - statePension);
+    
+    if (adjustedTarget <= 0) {
+      return {
+        pensionWithdrawal: 0,
+        taxFreeWithdrawal: 0,
+        totalTax: 0,
+        netIncome: statePension,
+        newTaxFreeUsed: taxFreeUsed
+      };
+    }
+
+    // Before age 58: tax-free only
+    if (currentAge < UK_PENSION_ACCESS_AGE) {
+      const withdrawal = Math.min(adjustedTarget, taxFreeBal);
+      return {
+        pensionWithdrawal: 0,
+        taxFreeWithdrawal: withdrawal,
+        totalTax: 0,
+        netIncome: withdrawal + statePension,
+        newTaxFreeUsed: taxFreeUsed
+      };
+    }
+
+    // Age 58+: Use optimization if enabled and conditions are met
+    if (useOptimization && yearsRemaining > 5 && (pensionBal > 0 && taxFreeBal > 0)) {
+      return findOptimalWithdrawalRatio(pensionBal, taxFreeBal, targetIncome, currentAge, taxFreeUsed, yearsRemaining, inflationRate, useBondTent, annualReturn, bondReturnRate, stockAllocRetirement, stockAllocLater, glidePeriodYears);
+    }
+
+    // Fallback to original pension-first strategy with 25% tax-free benefit
+    const remainingTaxFreeAllowance = Math.max(0, UK_PENSION_TAX_FREE_LIFETIME_LIMIT - taxFreeUsed);
+    
+    // Binary search for optimal pension withdrawal
+    let low = 0;
+    let high = Math.min(pensionBal, adjustedTarget * 1.5);
+    
+    for (let i = 0; i < 15; i++) {
+      const pensionWithdrawal = (low + high) / 2;
+      
+      // Calculate 25% tax-free portion
+      const potentialTaxFree = pensionWithdrawal * UK_PENSION_TAX_FREE_PERCENT;
+      const actualTaxFree = Math.min(potentialTaxFree, remainingTaxFreeAllowance);
+      const taxablePension = pensionWithdrawal - actualTaxFree;
+      
+      // Calculate annual tax (bug fix: use single tax function)
+      const totalTaxableIncome = taxablePension + statePension;
+      const totalTax = calculateUKIncomeTax(totalTaxableIncome);
+      const stateTax = calculateUKIncomeTax(statePension);
+      const pensionTax = Math.max(0, totalTax - stateTax);
+      
+      // Net from pension = tax-free portion + (taxable portion - tax)
+      const netFromPension = actualTaxFree + Math.max(0, taxablePension - pensionTax);
+      
+      if (Math.abs(netFromPension - adjustedTarget) < 1) break;
+      
+      if (netFromPension < adjustedTarget) {
+        low = pensionWithdrawal;
+      } else {
+        high = pensionWithdrawal;
+      }
+    }
+    
+    const pensionWithdrawal = Math.min(pensionBal, (low + high) / 2);
+    
+    // Final calculation
+    const potentialTaxFree = pensionWithdrawal * UK_PENSION_TAX_FREE_PERCENT;
+    const actualTaxFree = Math.min(potentialTaxFree, remainingTaxFreeAllowance);
+    const taxablePension = pensionWithdrawal - actualTaxFree;
+    
+    const totalTaxableIncome = taxablePension + statePension;
+    const totalTax = calculateUKIncomeTax(totalTaxableIncome);
+    const stateTax = calculateUKIncomeTax(statePension);
+    const pensionTax = Math.max(0, totalTax - stateTax);
+    
+    const netFromPension = actualTaxFree + Math.max(0, taxablePension - pensionTax);
+    
+    // Use ISA for shortfall
+    const shortfall = Math.max(0, adjustedTarget - netFromPension);
+    const taxFreeWithdrawal = Math.min(shortfall, taxFreeBal);
+    
+    return {
+      pensionWithdrawal,
+      taxFreeWithdrawal,
+      totalTax: pensionTax,
+      netIncome: netFromPension + taxFreeWithdrawal + statePension,
+      newTaxFreeUsed: taxFreeUsed + actualTaxFree
+    };
+  }
+
+  /**
+   * Calculate withdrawal using a specific pension ratio
+   * Bug fix: Input validation added
+   */
+  function calculateWithdrawalWithRatio(pensionBal, taxFreeBal, targetIncome, currentAge, taxFreeUsed, pensionRatio) {
+    // Input validation
+    if (pensionBal < 0 || taxFreeBal < 0) return { pensionWithdrawal: 0, taxFreeWithdrawal: 0, totalTax: 0, netIncome: 0, newTaxFreeUsed: taxFreeUsed };
+    if (targetIncome < 0) return { pensionWithdrawal: 0, taxFreeWithdrawal: 0, totalTax: 0, netIncome: 0, newTaxFreeUsed: taxFreeUsed };
+    if (pensionRatio < 0) pensionRatio = 0;
+    if (pensionRatio > 1) pensionRatio = 1;
+    
+    // Calculate state pension based on age
+    const statePension = currentAge >= UK_STATE_PENSION_AGE ? UK_STATE_PENSION_MONTHLY_2024 * 12 : 0;
+    let adjustedTarget = Math.max(0, targetIncome - statePension);
+    
+    if (adjustedTarget <= 0 || (pensionBal + taxFreeBal) <= 0) {
+      return {
+        pensionWithdrawal: 0,
+        taxFreeWithdrawal: 0,
+        totalTax: 0,
+        netIncome: statePension,
+        newTaxFreeUsed: taxFreeUsed
+      };
+    }
+
+    // Before age 58: tax-free only
+    if (currentAge < UK_PENSION_ACCESS_AGE) {
+      const withdrawal = Math.min(adjustedTarget, taxFreeBal);
+      return {
+        pensionWithdrawal: 0,
+        taxFreeWithdrawal: withdrawal,
+        totalTax: 0,
+        netIncome: withdrawal + statePension,
+        newTaxFreeUsed: taxFreeUsed
+      };
+    }
+
+    // Calculate target withdrawals based on ratio
+    let targetPensionWithdrawal = 0;
+    let targetTaxFreeWithdrawal = 0;
+    
+    if (pensionRatio > 0 && pensionBal > 0) {
+      // Simple approach: target a portion of the adjusted target from pension
+      // This will be refined through the tax calculation below
+      const maxPensionPortion = adjustedTarget * (pensionRatio / (pensionRatio + (1 - pensionRatio)));
+      targetPensionWithdrawal = Math.min(pensionBal, maxPensionPortion * 1.5); // Allow for tax grossing up
+    }
+
+    // Calculate actual withdrawal amounts with tax considerations
+    const remainingTaxFreeAllowance = Math.max(0, UK_PENSION_TAX_FREE_LIFETIME_LIMIT - taxFreeUsed);
+    const potentialTaxFree = targetPensionWithdrawal * UK_PENSION_TAX_FREE_PERCENT;
+    const actualTaxFree = Math.min(potentialTaxFree, remainingTaxFreeAllowance);
+    const taxablePension = targetPensionWithdrawal - actualTaxFree;
+    
+    // Calculate tax on pension withdrawal (bug fix: use single tax function)
+    const totalTaxableIncome = taxablePension + statePension;
+    const totalTax = calculateUKIncomeTax(totalTaxableIncome);
+    const stateTax = calculateUKIncomeTax(statePension);
+    const pensionTax = Math.max(0, totalTax - stateTax);
+    
+    const netFromPension = actualTaxFree + Math.max(0, taxablePension - pensionTax);
+    const shortfall = Math.max(0, adjustedTarget - netFromPension);
+    targetTaxFreeWithdrawal = Math.min(shortfall, taxFreeBal);
+
+    return {
+      pensionWithdrawal: targetPensionWithdrawal,
+      taxFreeWithdrawal: targetTaxFreeWithdrawal,
+      totalTax: pensionTax,
+      netIncome: netFromPension + targetTaxFreeWithdrawal + statePension,
+      newTaxFreeUsed: taxFreeUsed + actualTaxFree
+    };
+  }
+
+  /**
+   * Simulate portfolio survival with a specific pension withdrawal ratio
+   * Bug fix: Use global WITHDRAWAL_TOLERANCE constant
+   * Simplified: Just return years survived, no artificial bonuses
+   */
+  function simulateWithdrawalRatio(pensionBal, taxFreeBal, targetIncome, startAge, taxFreeUsed, pensionRatio, yearsRemaining, inflationRate, useBondTent, annualReturn, bondReturnRate, stockAllocRetirement, stockAllocLater, glidePeriodYears) {
+    let tempPensionBal = pensionBal;
+    let tempTaxFreeBal = taxFreeBal;
+    let tempTaxFreeUsed = taxFreeUsed;
+    
+    const simYears = Math.min(yearsRemaining, 25); // 25 years lookahead as requested
+
+    for (let year = 0; year < simYears; year++) {
+      const currentAge = startAge + year;
+      const inflationAdjustedTarget = targetIncome * Math.pow(1 + inflationRate, year);
+      
+      // Apply expected returns (use conservative estimate for optimization)
+      const stockAlloc = getStockAllocation(year);
+      const conservativeReturn = useBondTent ? 
+        (annualReturn * stockAlloc + bondReturnRate * (1 - stockAlloc)) * 0.8 : 
+        annualReturn * 0.8; // 80% of expected return for conservative estimate
+      
+      tempPensionBal *= (1 + conservativeReturn);
+      tempTaxFreeBal *= (1 + conservativeReturn);
+
+      // Calculate withdrawal using the specified ratio
+      const withdrawal = calculateWithdrawalWithRatio(
+        tempPensionBal,
+        tempTaxFreeBal,
+        inflationAdjustedTarget,
+        currentAge,
+        tempTaxFreeUsed,
+        pensionRatio
+      );
+
+      // Check if target is met (bug fix: use global constant)
+      if (withdrawal.netIncome < inflationAdjustedTarget * (1 - WITHDRAWAL_TOLERANCE)) {
+        return year; // Failed at this year
+      }
+
+      // Update balances
+      tempPensionBal = Math.max(0, tempPensionBal - withdrawal.pensionWithdrawal);
+      tempTaxFreeBal = Math.max(0, tempTaxFreeBal - withdrawal.taxFreeWithdrawal);
+      tempTaxFreeUsed = withdrawal.newTaxFreeUsed;
+    }
+
+    return simYears; // Survived all years tested
+  }
+
+  /**
+   * Find optimal withdrawal ratio - keep the original nested approach
+   * Simplified: Just find ratio that survives longest
+   */
+  function findOptimalWithdrawalRatio(pensionBal, taxFreeBal, targetIncome, currentAge, taxFreeUsed, yearsRemaining, inflationRate, useBondTent, annualReturn, bondReturnRate, stockAllocRetirement, stockAllocLater, glidePeriodYears) {
+    if (yearsRemaining <= 0 || (pensionBal + taxFreeBal) <= 0) {
+      return calculateOptimalAnnualWithdrawal(pensionBal, taxFreeBal, targetIncome, currentAge, taxFreeUsed, 0, false, inflationRate, useBondTent, annualReturn, bondReturnRate, stockAllocRetirement, stockAllocLater, glidePeriodYears);
+    }
+
+    let bestRatio = 0;
+    let bestYearsSurvived = -1;
+
+    // Test pension ratios from 0% to 100% in 10% increments
+    for (let pensionRatio = 0; pensionRatio <= 1.0; pensionRatio += 0.1) {
+      const yearsSurvived = simulateWithdrawalRatio(
+        pensionBal, 
+        taxFreeBal, 
+        targetIncome, 
+        currentAge, 
+        taxFreeUsed, 
+        pensionRatio, 
+        yearsRemaining,
+        inflationRate,
+        useBondTent,
+        annualReturn,
+        bondReturnRate,
+        stockAllocRetirement,
+        stockAllocLater,
+        glidePeriodYears
+      );
+      
+      if (yearsSurvived > bestYearsSurvived) {
+        bestYearsSurvived = yearsSurvived;
+        bestRatio = pensionRatio;
+      }
+    }
+
+    // Fine-tune around the best ratio found
+    const refinedRatio = refineOptimalRatio(
+      pensionBal, 
+      taxFreeBal, 
+      targetIncome, 
+      currentAge, 
+      taxFreeUsed, 
+      bestRatio, 
+      yearsRemaining,
+      inflationRate,
+      useBondTent,
+      annualReturn,
+      bondReturnRate,
+      stockAllocRetirement,
+      stockAllocLater,
+      glidePeriodYears
+    );
+
+    return calculateWithdrawalWithRatio(
+      pensionBal, 
+      taxFreeBal, 
+      targetIncome, 
+      currentAge, 
+      taxFreeUsed, 
+      refinedRatio
+    );
+  }
+
+  /**
+   * Fine-tune the optimal ratio around the best found ratio
+   * Simplified: Just find ratio that survives longest
+   */
+  function refineOptimalRatio(pensionBal, taxFreeBal, targetIncome, currentAge, taxFreeUsed, bestRatio, yearsRemaining, inflationRate, useBondTent, annualReturn, bondReturnRate, stockAllocRetirement, stockAllocLater, glidePeriodYears) {
+    let optimalRatio = bestRatio;
+    let bestYearsSurvived = simulateWithdrawalRatio(pensionBal, taxFreeBal, targetIncome, currentAge, taxFreeUsed, bestRatio, yearsRemaining, inflationRate, useBondTent, annualReturn, bondReturnRate, stockAllocRetirement, stockAllocLater, glidePeriodYears);
+
+    // Test ratios around the best in 2% increments
+    for (let offset = -0.08; offset <= 0.08; offset += 0.02) {
+      const testRatio = Math.max(0, Math.min(1, bestRatio + offset));
+      const yearsSurvived = simulateWithdrawalRatio(pensionBal, taxFreeBal, targetIncome, currentAge, taxFreeUsed, testRatio, yearsRemaining, inflationRate, useBondTent, annualReturn, bondReturnRate, stockAllocRetirement, stockAllocLater, glidePeriodYears);
+      
+      if (yearsSurvived > bestYearsSurvived) {
+        bestYearsSurvived = yearsSurvived;
+        optimalRatio = testRatio;
+      }
+    }
+
+    return optimalRatio;
+  }
+
+  // Main binary search logic with 30-second optimizations
+  let low = 0;
+  let high = maxSavingMonths;
+  let bestSolution = null;
   
-  console.log("\n--- WITHOUT Bond Tent (100% Stocks) ---");
-  strategies.forEach(strategy => {
-    console.log(`\n${strategy.name}:`);
-    const result = calculateSavingMonthsForRetirement(
-      460000, 470000, 4000, 4000, 0.07, 0.15, 4000, 40, 0.9, 0.025, strategy.id, 0.7, 600, 1000, false
+  while (high - low > 1) {
+    // Time check - conservative 27 second limit
+    if (Date.now() - startTime > 27000) {
+      console.warn("Approaching 30s limit, returning best result");
+      return bestSolution || [-1, 0, 0];
+    }
+    
+    const savingMonths = Math.floor((low + high) / 2);
+    const retirementStartAge = currentAge + (savingMonths / 12);
+    
+    if (retirementStartAge >= 95) {
+      high = savingMonths;
+      continue;
+    }
+    
+    // Calculate EXPECTED portfolio values at retirement for return values
+    let expectedPensionAtRetirement = pensionBalance;
+    let expectedTaxFreeAtRetirement = taxFreeBalance;
+    const monthlyGrowthFactor = Math.pow(1 + annualReturn, 1/12);
+    
+    for (let month = 0; month < savingMonths; month++) {
+      expectedPensionAtRetirement = expectedPensionAtRetirement * monthlyGrowthFactor + monthlyPensionSavings;
+      expectedTaxFreeAtRetirement = expectedTaxFreeAtRetirement * monthlyGrowthFactor + monthlyTaxFreeSavings;
+    }
+    
+    const expectedTotalValue = expectedPensionAtRetirement + expectedTaxFreeAtRetirement;
+    
+    // Quick check using expected values for 4% rule
+    const expectedWithdrawalRate = (monthlyWithdrawalNeeded * 12) / expectedTotalValue;
+    if (expectedWithdrawalRate > 0.04) {
+      console.log(`Instant fail: ${(expectedWithdrawalRate * 100).toFixed(1)}% expected withdrawal rate at ${(savingMonths/12).toFixed(1)} years`);
+      low = savingMonths;
+      continue;
+    }
+    
+    // Get adaptive simulation count based on withdrawal rate at retirement
+    let adaptiveSimulations = getAdaptiveSimulations(
+      expectedPensionAtRetirement, expectedTaxFreeAtRetirement, monthlyWithdrawalNeeded, simulations, savingMonths / 12
     );
     
-    if (result[0] > 0) {
-      console.log(`  Years needed: ${result[0].toFixed(1)}`);
-      console.log(`  Target pension: £${result[1].toLocaleString()}`);
-      console.log(`  Target tax-free: £${result[2].toLocaleString()}`);
-    } else if (result[0] === -1) {
-      console.log("  Not achievable within time limit");
-    } else {
-      console.log("  Error in calculation");
+    // For very short accumulation periods, force more simulations to reduce variance
+    // This helps prevent non-monotonic results like £4k > £5k
+    if (savingMonths < 36 && expectedWithdrawalRate > 0.03) { // < 3 years and borderline
+      adaptiveSimulations = Math.max(adaptiveSimulations, Math.min(1200, simulations * 1.2));
+      console.log(`Borderline case (${(savingMonths/12).toFixed(1)}y, ${(expectedWithdrawalRate*100).toFixed(1)}%), using ${adaptiveSimulations} simulations`);
     }
-  });
-  
-  console.log("\n--- WITH Bond Tent (60% → 40% Stocks over 10 years) ---");
-  strategies.forEach(strategy => {
-    console.log(`\n${strategy.name}:`);
-    const result = calculateSavingMonthsForRetirement(
-      460000, 470000, 4000, 4000, 0.07, 0.15, 4000, 40, 0.9, 0.025, strategy.id, 0.7, 600, 1000, 
-      true, 0.03, 0.05, 0.6, 0.4, 10
-    );
     
-    if (result[0] > 0) {
-      console.log(`  Years needed: ${result[0].toFixed(1)}`);
-      console.log(`  Target pension: £${result[1].toLocaleString()}`);
-      console.log(`  Target tax-free: £${result[2].toLocaleString()}`);
-    } else if (result[0] === -1) {
-      console.log("  Not achievable within time limit");
-    } else {
-      console.log("  Error in calculation");
+    // Run Monte Carlo simulation for retirement phase
+    let successfulSimulations = 0;
+    let failedSimulations = 0;
+    
+    for (let sim = 0; sim < adaptiveSimulations; sim++) {
+      // Early exit check every 100 simulations
+      if (sim > 0 && sim % 100 === 0) {
+        if (shouldExitEarly(successfulSimulations, failedSimulations, adaptiveSimulations, targetSuccessRate)) {
+          console.log(`Early exit at ${sim} simulations`);
+          break;
+        }
+      }
+      
+      // Each simulation gets its own accumulation phase with random returns
+      let pensionAtRetirement = pensionBalance;
+      let taxFreeAtRetirement = taxFreeBalance;
+      
+      // Accumulation phase with random returns
+      for (let month = 0; month < savingMonths; month++) {
+        const currentReturn = generateRandomReturn();
+        pensionAtRetirement = pensionAtRetirement * (1 + currentReturn) + monthlyPensionSavings;
+        taxFreeAtRetirement = taxFreeAtRetirement * (1 + currentReturn) + monthlyTaxFreeSavings;
+      }
+      
+      let pensionBal = pensionAtRetirement;
+      let taxFreeBal = taxFreeAtRetirement;
+      let simulationSuccess = true;
+      let pensionTaxFreeUsed = 0;
+
+      let recentReturns = [];
+      let bearMarketMonths = 0;
+
+      // Withdrawal phase simulation (annual withdrawals)
+      const withdrawalYears = 95 - retirementStartAge;
+      const initialTotalValue = pensionBal + taxFreeBal;
+      
+      for (let year = 0; year < withdrawalYears && simulationSuccess; year++) {
+        const yearsIntoRetirement = year;
+        const currentRetirementAge = retirementStartAge + yearsIntoRetirement;
+        
+        // Apply annual returns
+        const currentReturn = useBondTent ? 
+          getAnnualPortfolioReturn(yearsIntoRetirement) : 
+          generateAnnualReturn();
+        
+        pensionBal = pensionBal * (1 + currentReturn);
+        taxFreeBal = taxFreeBal * (1 + currentReturn);
+        
+        // Calculate inflation-adjusted annual withdrawal target
+        const annualInflationAdjustedWithdrawal = monthlyWithdrawalNeeded * 12 * Math.pow(1 + inflationRate, yearsIntoRetirement);
+        
+        // Get strategy-adjusted target amount
+        const targetAmount = getStrategyWithdrawalAmount(
+          annualInflationAdjustedWithdrawal, 
+          pensionBal + taxFreeBal, 
+          initialTotalValue, 
+          year, 
+          withdrawalStrategy
+        );
+        
+        // Calculate buffer for cash buffer strategy
+        let bufferAmount = 0;
+        if (withdrawalStrategy === 3) {
+          bufferAmount = calculateCashBufferAmount(recentReturns, bearMarketMonths, targetAmount);
+        }
+        
+        // Calculate optimal annual withdrawal with years remaining for optimization
+        const withdrawal = calculateOptimalAnnualWithdrawal(
+          pensionBal,
+          taxFreeBal,
+          targetAmount,
+          currentRetirementAge,
+          pensionTaxFreeUsed,
+          withdrawalYears - year, // Years remaining
+          true, // Use optimization
+          inflationRate,
+          useBondTent,
+          annualReturn,
+          bondReturnRate,
+          stockAllocRetirement,
+          stockAllocLater,
+          glidePeriodYears
+        );
+        
+        const totalNetIncome = withdrawal.netIncome + bufferAmount;
+        if (totalNetIncome < targetAmount * (1 - WITHDRAWAL_TOLERANCE)) {
+          simulationSuccess = false;
+          break;
+        }
+        
+        pensionBal = Math.max(0, pensionBal - withdrawal.pensionWithdrawal);
+        taxFreeBal = Math.max(0, taxFreeBal - withdrawal.taxFreeWithdrawal);
+        pensionTaxFreeUsed = withdrawal.newTaxFreeUsed;
+        
+        // Update bear market tracking (simplified for annual)
+        if (currentReturn < -0.1) { // 10% annual loss
+          bearMarketMonths = Math.min(bearMarketMonths + 12, 36);
+        } else {
+          bearMarketMonths = Math.max(bearMarketMonths - 6, 0);
+        }
+        
+        // Update recent returns (track last 3 years)
+        recentReturns.push(currentReturn);
+        if (recentReturns.length > 3) {
+          recentReturns.shift();
+        }
+      }
+
+      if (simulationSuccess) {
+        successfulSimulations++;
+      } else {
+        failedSimulations++;
+      }
     }
-  });
+    
+    const actualSimulations = successfulSimulations + failedSimulations;
+    const successRate = successfulSimulations / actualSimulations;
+    
+    // Standard binary search - no skipping for accuracy
+    if (successRate >= targetSuccessRate) {
+      // Return EXPECTED values, not random accumulation values
+      bestSolution = [savingMonths / 12, expectedPensionAtRetirement, expectedTaxFreeAtRetirement];
+      high = savingMonths;
+    } else {
+      low = savingMonths;
+    }
+  }
+  
+  const totalTime = Date.now() - startTime;
+  console.log(`Completed in ${totalTime}ms`);
+  
+  return bestSolution || [-1, 0, 0];
 }
